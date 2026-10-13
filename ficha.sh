@@ -38,6 +38,26 @@ kvx() { local t="$1" k v; shift; for k in "$@"; do v="$(kv "$t" "$k")"; [ -n "$v
 kv_all() { printf '%s\n' "$1" | awk -v k="$2" '{ l=$0; sub(/^[ \t]+/, "", l); if (index(l, k ":") == 1) { v = substr(l, length(k) + 2); sub(/^[ \t]+/, "", v); print v } }'; }
 digits() { printf '%s' "$1" | sed 's/[^0-9.].*//'; }
 gb_from_bytes() { awk -v b="$1" 'BEGIN { if (b > 0) printf "%.0f", b / 1e9 }'; }
+# polegadas a partir do EDID (texto hexadecimal). Usa o tamanho em MILIMETROS do bloco de timing
+# detalhado (bytes 66-68), que e mais preciso que os cm inteiros dos bytes 21 e 22; mas alguns
+# fabricantes gravam mm errados, entao o mm so vale se bater com os cm (diferenca de ate 1,5 cm).
+# Duas casas decimais: o site arredonda para o tamanho comercial (15,55 -> 15,6" e nao 15,4").
+# Descarta valores sem sentido (0, proporcao no lugar do tamanho, telas < 7" ou > 100").
+edid_inches() {
+    local h="$1" cw=0 cv=0 mw=0 mv=0
+    b() { printf '%d' "0x${h:$(($1 * 2)):2}"; }
+    [ ${#h} -ge 46 ] && { cw=$(b 21); cv=$(b 22); }
+    if [ ${#h} -ge 138 ] && [ "$(b 54)$(b 55)" != "00" ]; then
+        mw=$(( $(b 66) + (($(b 68) >> 4) << 8) )); mv=$(( $(b 67) + (($(b 68) & 15) << 8) ))
+    fi
+    awk -v cw="$cw" -v cv="$cv" -v mw="$mw" -v mv="$mv" 'function abs(x) { return x < 0 ? -x : x }
+        BEGIN {
+            mm = mw > 50 && mv > 50; cm = cw > 0 && cv > 0
+            if (mm && cm && (abs(mw - cw * 10) > 15 || abs(mv - cv * 10) > 15)) mm = 0
+            if (mm) r = sqrt(mw * mw + mv * mv) / 25.4; else if (cm) r = sqrt(cw * cw + cv * cv) / 2.54; else exit
+            if (r >= 7 && r <= 100) printf "%.2f\n", r
+        }'
+}
 
 printf '\n  \033[1myCODEX - Ficha Tecnica\033[0m\n  Coletando informacoes da maquina...\n' >&2
 
@@ -117,14 +137,31 @@ $(kv_all "$DSP" 'Chipset Model')
 EOF
     GPUS="$GPUS]"
     RES="$(kv "$DSP" 'Resolution' | awk '{ print $1 "x" $3 }')"
-    # polegadas: 1) pelo nome comercial ("16-inch" / "16 polegadas"), que e exato
-    INCHES="$(printf '%s %s' "$FAMILY" "$MODEL" | sed -En 's/.*[^0-9.]([0-9][0-9.]*)[- ]?(inch|"|polegadas|pol).*/\1/p' | head -1)"
-    # 2) reserva: tamanho fisico do painel interno (EDID, bytes 21 e 22 = largura/altura em cm inteiros)
-    EDID="$(ioreg -l -w0 -r -c AppleBacklightDisplay 2>/dev/null | sed -n 's/.*"IODisplayEDID" = <\([0-9a-fA-F]*\)>.*/\1/p' | head -1)"
-    if [ -z "$INCHES" ] && [ ${#EDID} -ge 46 ]; then
-        HC=$((16#$(printf '%s' "$EDID" | cut -c43-44))); VC=$((16#$(printf '%s' "$EDID" | cut -c45-46)))
-        [ "$HC" -gt 0 ] && INCHES="$(awk -v h="$HC" -v v="$VC" 'BEGIN { printf "%.1f", sqrt(h*h + v*v) / 2.54 }')"
+    # polegadas, do mais exato para o menos:
+    #  (o site ainda confere o identificador no banco macs.json, que prevalece sobre a medida)
+    #  1) nome comercial ("MacBook Pro (16-inch, 2019)", "13-inch MacBook Pro") - o espaco no comeco
+    #     garante que o numero no inicio do nome tambem seja achado
+    INCHES="$(printf ' %s %s' "$FAMILY" "$MODEL" | sed -En 's/.*[^0-9.]([0-9][0-9.]*)[- ]?(inch|"|polegadas|pol).*/\1/p' | head -1)" && SRC="nome do modelo"
+    #  2) tamanho fisico da tela embutida, perguntado ao proprio macOS (CoreGraphics, em mm):
+    #     vale para qualquer Mac com tela embutida
+    if [ -z "$INCHES" ]; then
+        INCHES="$(osascript -l JavaScript -e '
+            ObjC.import("AppKit"); ObjC.import("CoreGraphics");
+            var r = "", s = $.NSScreen.screens;
+            for (var i = 0; i < s.count; i++) {
+                var id = ObjC.unwrap(s.objectAtIndex(i).deviceDescription.objectForKey("NSScreenNumber"));
+                if ($.CGDisplayIsBuiltin(id)) { var z = $.CGDisplayScreenSize(id); r = (Math.sqrt(z.width * z.width + z.height * z.height) / 25.4).toFixed(2); }
+            }
+            r' 2>/dev/null)"
+        INCHES="$(awk -v r="$INCHES" 'BEGIN { if (r != "" && r >= 7 && r <= 100) print r }')"; SRC="macOS (CoreGraphics)"
     fi
+    #  3) EDID do painel interno (Intel: AppleBacklightDisplay) ou, por ultimo, de qualquer tela
+    if [ -z "$INCHES" ]; then
+        EDID="$(ioreg -l -w0 -r -c AppleBacklightDisplay 2>/dev/null | sed -n 's/.*"IODisplayEDID" = <\([0-9a-fA-F]*\)>.*/\1/p' | head -1)"
+        [ -z "$EDID" ] && EDID="$(printf '%s' "$IOREG" | sed -n 's/.*"IODisplayEDID" = <\([0-9a-fA-F]*\)>.*/\1/p' | head -1)"
+        [ -n "$EDID" ] && INCHES="$(edid_inches "$EDID")"; SRC="EDID da tela"
+    fi
+    if [ -n "$INCHES" ]; then step "Tela: $INCHES pol. (via $SRC)"; else step "Tela: tamanho nao encontrado (preencha na ficha)"; fi
     TOUCH=""
 
     step "Dispositivos"
@@ -244,14 +281,18 @@ EOF
 $(printf '%s\n' "$PCI" | grep -iE 'vga compatible|3d controller|display controller' | sed 's/^[^:]*:[^:]*: //')
 EOF
     GPUS="$GPUS]"
-    # painel interno (eDP/LVDS): resolucao pelos modos e tamanho pelo EDID (bytes 21 e 22 = largura/altura em cm)
-    for c in /sys/class/drm/card*-eDP-* /sys/class/drm/card*-LVDS-* /sys/class/drm/card*-DSI-*; do
-        [ -e "$c/edid" ] || continue
-        [ -z "$RES" ] && RES="$(head -1 "$c/modes" 2>/dev/null)"
-        HC="$(od -An -tu1 -j21 -N1 "$c/edid" 2>/dev/null | tr -d ' ')"; VC="$(od -An -tu1 -j22 -N1 "$c/edid" 2>/dev/null | tr -d ' ')"
-        [ -n "$HC" ] && [ "$HC" != "0" ] && INCHES="$(awk -v h="$HC" -v v="$VC" 'BEGIN { printf "%.1f", sqrt(h*h + v*v) / 2.54 }')"
+    # tela: primeiro o painel interno (eDP/LVDS/DSI); se nao houver (desktop), a primeira tela conectada.
+    # Em PCs com 2 placas de video existem 2 saidas internas e uma delas tem o EDID VAZIO: pula essas.
+    for c in /sys/class/drm/card*-eDP-* /sys/class/drm/card*-LVDS-* /sys/class/drm/card*-DSI-* /sys/class/drm/card*-*; do
+        [ -s "$c/edid" ] || continue
+        [ "$(cat "$c/status" 2>/dev/null)" = "disconnected" ] && continue
+        I="$(edid_inches "$(od -An -tx1 -v "$c/edid" 2>/dev/null | tr -d ' \n')")"
+        R="$(head -1 "$c/modes" 2>/dev/null)"
+        [ -z "$I" ] && [ -z "$R" ] && continue
+        INCHES="$I"; RES="$R"
         break
     done
+    if [ -n "$INCHES" ]; then step "Tela: $INCHES pol. (via EDID de ${c##*/})"; else step "Tela: tamanho nao encontrado (preencha na ficha)"; fi
     if [ -z "$RES" ] && have xrandr; then RES="$(xrandr --current 2>/dev/null | awk '/ connected/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+x[0-9]+\+/) { sub(/\+.*/, "", $i); print $i; exit } }')"; fi
     INPUTS="$(sed -n 's/^N: Name="\(.*\)"$/\1/p' /proc/bus/input/devices 2>/dev/null)"
     printf '%s\n' "$INPUTS" | grep -qiE 'touch ?screen|wacom.*finger|elan.*touchscreen' && TOUCH=1
