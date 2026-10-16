@@ -266,9 +266,13 @@ function Ipp-Parse([byte[]]$r) {
         $tag = $r[$i]; $i++
         if ($tag -eq 3) { break }
         if ($tag -lt 0x10) { continue }
+        # resposta cortada: fica com o que ja leu
+        if ($i + 2 -gt $r.Length) { break }
         $nl = [int]$r[$i] * 256 + $r[$i + 1]; $i += 2
+        if ($i + $nl + 2 -gt $r.Length) { break }
         $name = [Text.Encoding]::ASCII.GetString($r, $i, $nl); $i += $nl
         $vl = [int]$r[$i] * 256 + $r[$i + 1]; $i += 2
+        if ($i + $vl -gt $r.Length) { break }
         # resolucao (0x32) vem em binario: 4 bytes x, 4 bytes y, 1 byte unidade -> "300x300"
         $val = if ($tag -eq 0x32 -and $vl -eq 9) { '{0}x{1}' -f ([BitConverter]::ToInt32(@($r[($i + 3)..$i]), 0)), ([BitConverter]::ToInt32(@($r[($i + 7)..($i + 4)]), 0)) }
                else { [Text.Encoding]::UTF8.GetString($r, $i, $vl) }
@@ -298,6 +302,7 @@ function Ipp-Call([string]$url, [string]$path, [int]$op, $opAttrs, $jobAttrs, [b
     $rq = [Net.HttpWebRequest]::Create("$url$path")
     $rq.Method = 'POST'; $rq.ContentType = 'application/ipp'; $rq.Timeout = $timeout; $rq.ReadWriteTimeout = $timeout
     $rq.Proxy = $null   # impressora e local: proxy da empresa so atrapalha
+    $rq.KeepAlive = $false   # servidor embutido de impressora costuma se perder com conexao reaproveitada
     if ($url -like 'https*') { Load-Cs; $rq.ServerCertificateValidationCallback = [YcTls]::Any }
     $rq.ContentLength = $body.Length
     $s = $rq.GetRequestStream(); $s.Write($body, 0, $body.Length); $s.Close()
@@ -313,18 +318,29 @@ $ycWhy = @{}
 function Printer-Info([string]$ip, [bool]$http = $true) {
     $want = @('printer-name', 'printer-info', 'printer-location', 'printer-make-and-model', 'document-format-supported',
               'pwg-raster-document-resolution-supported', 'pwg-raster-document-type-supported', 'urf-supported')
-    $urls = @(); if ($http) { $urls += "http://${ip}:631" }; $urls += "https://${ip}:443"
+    # 631 sem e com criptografia (muitas impressoras exigem ipps na propria 631), depois 443 e 80
+    $urls = @(); if ($http) { $urls += "http://${ip}:631", "https://${ip}:631" }; $urls += "https://${ip}:443", "http://${ip}:80"
+    $why = @()
     foreach ($url in $urls) {
+        $retry = $true; $lab = $url -replace '://[^:]+:', ':'   # "http:631"
         foreach ($path in '/ipp/print', '/ipp', '/ipp/printer', '/') {
             $a = $null
-            try { $a = Ipp-Call $url $path 0x000B ([ordered]@{ 'requested-attributes' = @(0x44, $want) }) $null $null 5000 }
+            try { $a = Ipp-Call $url $path 0x000B ([ordered]@{ 'requested-attributes' = @(0x44, $want) }) $null $null 8000 }
             catch {
-                $script:ycWhy[$ip] = "$url$path : $($_.Exception.InnerException.Message)$(if (-not $_.Exception.InnerException) { $_.Exception.Message })"
-                # porta fechada ou sem resposta: nao adianta tentar outros caminhos nela
-                if ("$_" -match 'conectar|connect|tempo limite|timed out|recusou|refused') { break }
-                continue
+                # motivo curto: codigo HTTP, falha de rede (Timeout, ConnectFailure, TrustFailure...) ou erro ao ler a resposta
+                $e = $_.Exception; while ($e.InnerException -and $e -isnot [Net.WebException]) { $e = $e.InnerException }
+                $st = if ($e -is [Net.WebException]) { if ($e.Response) { "HTTP $([int]$e.Response.StatusCode)" } else { "$($e.Status)" } } else { "erro: $($e.Message)" }
+                $why += "$lab$path=$st"
+                # impressora em Wi-Fi acordando: tenta o mesmo caminho mais uma vez
+                if ($st -eq 'Timeout' -and $retry) {
+                    $retry = $false
+                    try { $a = Ipp-Call $url $path 0x000B ([ordered]@{ 'requested-attributes' = @(0x44, $want) }) $null $null 8000 } catch { }
+                }
+                # porta fechada / sem resposta / TLS recusado: nao adianta tentar outros caminhos nela
+                if (-not $a -and $st -match '^(Timeout|ConnectFailure|ConnectionClosed|ReceiveFailure|SendFailure|SecureChannelFailure|TrustFailure)$') { break }
+                if (-not $a) { continue }
             }
-            if (-not $a -or $a.status -ge 0x100) { $script:ycWhy[$ip] = "$url$path : IPP status 0x{0:x4}" -f $a.status; continue }
+            if (-not $a -or $a.status -ge 0x100) { $why += "$lab$path=IPP 0x{0:x4}" -f $a.status; continue }
             $model = Tidy "$($a['printer-make-and-model'])"
             # printer-info costuma ser o nome amigavel ("EPSON ET-M3170 Series"); printer-name as vezes e um codigo
             $name = Tidy "$($a['printer-info'])"
@@ -338,8 +354,9 @@ function Printer-Info([string]$ip, [bool]$http = $true) {
                 pwgRes = @($a['pwg-raster-document-resolution-supported']); pwgTypes = @($a['pwg-raster-document-type-supported'])
                 urf = @($a['urf-supported'])
             }
+        }
     }
-    }
+    $script:ycWhy[$ip] = $why -join '  '
 }
 
 function To-IPv4([string]$h) {
@@ -504,6 +521,9 @@ function Find-Printers {
         $n = if ($snmp[$ip]) { $snmp[$ip] } else { "Impressora $ip" }
         if ($p -contains 9100 -and $n -notmatch 'epson|canon|ecotank|inkjet|deskjet|officejet|pixma|stylus') {
             [pscustomobject]@{ ip = $ip; path = $null; name = $n; model = ''; location = 'porta 9100 (PCL)'; formats = @(); ok = $true; raw = $true }
+        } elseif ($snmp[$ip] -or $p.Count) {
+            # e impressora, mas nao deu para conversar: aparece na lista (desabilitada) com o motivo
+            [pscustomobject]@{ ip = $ip; path = $null; name = $n; model = ''; location = "IPP n$([char]0xe3)o respondeu"; formats = @(); ok = $false; why = $ycWhy[$ip] }
         }
     })
     $net
@@ -787,7 +807,12 @@ function Send-Ficha([string]$html, [bool]$land, [string]$ip) {
         Load-Cs
         $doc = [YcRaster]::Make((Render $html $false $land), $land, $urf, $res, $gray)
     }
-    $r = Ipp-Call $t.url $t.path 0x0002 ([ordered]@{ 'job-name' = @(0x42, 'Ficha Tecnica'); 'document-format' = @(0x49, $fmt) }) $job $doc 60000
+    # impressora ocupada (0x0507, outro trabalho em andamento): espera e tenta de novo por ate ~1 minuto
+    for ($n = 0; $n -lt 12; $n++) {
+        $r = Ipp-Call $t.url $t.path 0x0002 ([ordered]@{ 'job-name' = @(0x42, 'Ficha Tecnica'); 'document-format' = @(0x49, $fmt) }) $job $doc 60000
+        if ($r.status -ne 0x0507) { break }
+        Start-Sleep -Seconds 5
+    }
     if ($r.status -ge 0x100) { return @{ ok = $false; code = 'recusou'; detail = ('{0} (codigo 0x{1:x4})' -f $t.name, $r.status) } }
     Write-Host ("  Ficha enviada para {0} ({1})" -f $t.name, $t.ip) -ForegroundColor Green
     @{ ok = $true; detail = $t.name }
@@ -857,7 +882,7 @@ function load(fresh) {
       row.className = 'p' + (p.ok ? '' : ' off');
       inp.type = 'radio'; inp.name = 'p'; inp.value = p.ip; inp.disabled = !p.ok; inp.checked = p === sel;
       txt.appendChild(el('b', p.name));
-      txt.appendChild(el('small', [p.model !== p.name ? p.model : '', p.location, p.ip.indexOf('win:') ? p.ip : ''].filter(Boolean).join(' \u00b7 ') + (p.ok ? '' : ' \u2014 formato n\u00e3o suportado')));
+      txt.appendChild(el('small', [p.model !== p.name ? p.model : '', p.location, p.ip.indexOf('win:') ? p.ip : ''].filter(Boolean).join(' \u00b7 ') + (p.ok || p.why ? '' : ' \u2014 formato n\u00e3o suportado')));
       row.appendChild(inp); row.appendChild(txt); list.appendChild(row);
     });
     show(ps.length === 1 ? 'Impressora encontrada:' : 'Escolha a impressora:');
@@ -912,7 +937,7 @@ function Handle-Client($client) {
     if ($req[0] -eq 'GET' -and $path -eq '/impressoras') {
         if ($hd['origin'] -and $hd['origin'] -ne $self) { Send-Resp $st 403 'text/plain' 'proibido'; return }
         $ps = @(Get-Printers ($req[1] -match 'novo=1') | ForEach-Object {
-            [ordered]@{ ip = $_.ip; name = $_.name; model = $_.model; location = $_.location; ok = $_.ok
+            [ordered]@{ ip = $_.ip; name = $_.name; model = $_.model; location = $_.location; ok = $_.ok; why = [bool]$_.why
                         pre = [bool]($ycPrinterMatch -and "$($_.name) $($_.model)" -match [regex]::Escape($ycPrinterMatch)) }
         })
         Send-Resp $st 200 'application/json' (@{ printers = $ps } | ConvertTo-Json -Depth 4 -Compress)
@@ -946,7 +971,8 @@ $found = @(Get-Printers $true)
 foreach ($p in $found) {
     if ($p.win) { Write-Host ("  - {0} ({1})" -f $p.name, $p.location) -ForegroundColor Green }
     elseif ($p.ok) { Write-Host ("  - {0} ({1})" -f $p.name, $p.ip) -ForegroundColor Green }
-    else { Write-Host ("  - {0} ({1}) - formato nao suportado" -f $p.name, $p.ip) -ForegroundColor DarkGray }
+    elseif ($p.why) { Write-Host ("  - {0} ({1}) - IPP nao respondeu" -f $p.name, $p.ip) -ForegroundColor Yellow }
+    else { Write-Host ("  - {0} ({1}) - formato nao suportado: {2}" -f $p.name, $p.ip, ($p.formats -join ' ')) -ForegroundColor DarkGray }
 }
 if (-not $found.Count) { Write-Host '  Nenhuma impressora encontrada agora (da para procurar de novo na hora de imprimir).' -ForegroundColor Yellow }
 Write-Host ''
