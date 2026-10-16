@@ -238,6 +238,7 @@ if ($ycNoPrint) { return }
 $ycPort = 8631
 $ycList = $null
 [Net.ServicePointManager]::Expect100Continue = $false
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 function Add16($l, [int]$x) { $l.Add([byte](($x -shr 8) -band 255)); $l.Add([byte]($x -band 255)) }
 function Add32($l, [int]$x) { Add16 $l (($x -shr 16) -band 65535); Add16 $l ($x -band 65535) }
@@ -268,20 +269,24 @@ function Ipp-Parse([byte[]]$r) {
         $nl = [int]$r[$i] * 256 + $r[$i + 1]; $i += 2
         $name = [Text.Encoding]::ASCII.GetString($r, $i, $nl); $i += $nl
         $vl = [int]$r[$i] * 256 + $r[$i + 1]; $i += 2
-        $val = [Text.Encoding]::UTF8.GetString($r, $i, $vl); $i += $vl
+        # resolucao (0x32) vem em binario: 4 bytes x, 4 bytes y, 1 byte unidade -> "300x300"
+        $val = if ($tag -eq 0x32 -and $vl -eq 9) { '{0}x{1}' -f ([BitConverter]::ToInt32(@($r[($i + 3)..$i]), 0)), ([BitConverter]::ToInt32(@($r[($i + 7)..($i + 4)]), 0)) }
+               else { [Text.Encoding]::UTF8.GetString($r, $i, $vl) }
+        $i += $vl
         if ($nl) { $last = $name; if (-not $o.ContainsKey($name)) { $o[$name] = @() } }
         if ($last) { $o[$last] += $val }
     }
     $o
 }
 
-function Ipp-Call([string]$ip, [string]$path, [int]$op, $opAttrs, $jobAttrs, [byte[]]$doc, [int]$timeout) {
+# $url = "http://IP:631" ou "https://IP:443" (IPP seguro: o certificado da impressora e sempre autoassinado)
+function Ipp-Call([string]$url, [string]$path, [int]$op, $opAttrs, $jobAttrs, [byte[]]$doc, [int]$timeout) {
     $l = New-Object 'Collections.Generic.List[byte]'
     $l.Add(2); $l.Add(0); Add16 $l $op; Add32 $l 1
     $base = [ordered]@{
         'attributes-charset'          = @(0x47, 'utf-8')
-        'attributes-natural-language' = @(0x48, 'pt-br')
-        'printer-uri'                 = @(0x45, "ipp://$ip$path")
+        'attributes-natural-language' = @(0x48, 'en')
+        'printer-uri'                 = @(0x45, (($url -replace '^http', 'ipp') + $path))
         'requesting-user-name'        = @(0x42, 'ycodex')
     }
     if ($opAttrs) { foreach ($k in $opAttrs.Keys) { $base[$k] = $opAttrs[$k] } }
@@ -290,9 +295,10 @@ function Ipp-Call([string]$ip, [string]$path, [int]$op, $opAttrs, $jobAttrs, [by
     $l.Add(3)
     if ($doc) { $l.AddRange($doc) }
     $body = $l.ToArray()
-    $rq = [Net.HttpWebRequest]::Create("http://${ip}:631$path")
+    $rq = [Net.HttpWebRequest]::Create("$url$path")
     $rq.Method = 'POST'; $rq.ContentType = 'application/ipp'; $rq.Timeout = $timeout; $rq.ReadWriteTimeout = $timeout
     $rq.Proxy = $null   # impressora e local: proxy da empresa so atrapalha
+    if ($url -like 'https*') { Load-Cs; $rq.ServerCertificateValidationCallback = [YcTls]::Any }
     $rq.ContentLength = $body.Length
     $s = $rq.GetRequestStream(); $s.Write($body, 0, $body.Length); $s.Close()
     $rs = $rq.GetResponse(); $ms = New-Object IO.MemoryStream; $rs.GetResponseStream().CopyTo($ms); $rs.Close()
@@ -300,11 +306,25 @@ function Ipp-Call([string]$ip, [string]$path, [int]$op, $opAttrs, $jobAttrs, [by
 }
 
 # pergunta para a impressora quem ela e (nome, modelo, local) e quais formatos aceita
-function Printer-Info([string]$ip) {
-    $want = @('printer-name', 'printer-info', 'printer-location', 'printer-make-and-model', 'document-format-supported')
-    foreach ($path in '/ipp/print', '/ipp') {
-        $a = Try-Get { Ipp-Call $ip $path 0x000B ([ordered]@{ 'requested-attributes' = @(0x44, $want) }) $null $null 3000 }
-        if ($a -and $a.status -lt 0x100) {
+# formatos que o script sabe gerar, na ordem de preferencia (raster = Mopria/IPP Everywhere e AirPrint)
+$ycFormats = 'application/pdf', 'image/pwg-raster', 'image/urf', 'image/jpeg'
+$ycWhy = @{}
+
+function Printer-Info([string]$ip, [bool]$http = $true) {
+    $want = @('printer-name', 'printer-info', 'printer-location', 'printer-make-and-model', 'document-format-supported',
+              'pwg-raster-document-resolution-supported', 'pwg-raster-document-type-supported', 'urf-supported')
+    $urls = @(); if ($http) { $urls += "http://${ip}:631" }; $urls += "https://${ip}:443"
+    foreach ($url in $urls) {
+        foreach ($path in '/ipp/print', '/ipp', '/ipp/printer', '/') {
+            $a = $null
+            try { $a = Ipp-Call $url $path 0x000B ([ordered]@{ 'requested-attributes' = @(0x44, $want) }) $null $null 5000 }
+            catch {
+                $script:ycWhy[$ip] = "$url$path : $($_.Exception.InnerException.Message)$(if (-not $_.Exception.InnerException) { $_.Exception.Message })"
+                # porta fechada ou sem resposta: nao adianta tentar outros caminhos nela
+                if ("$_" -match 'conectar|connect|tempo limite|timed out|recusou|refused') { break }
+                continue
+            }
+            if (-not $a -or $a.status -ge 0x100) { $script:ycWhy[$ip] = "$url$path : IPP status 0x{0:x4}" -f $a.status; continue }
             $model = Tidy "$($a['printer-make-and-model'])"
             # printer-info costuma ser o nome amigavel ("EPSON ET-M3170 Series"); printer-name as vezes e um codigo
             $name = Tidy "$($a['printer-info'])"
@@ -313,10 +333,12 @@ function Printer-Info([string]$ip) {
             if (-not $name) { $name = $ip }
             $formats = @($a['document-format-supported'])
             return [pscustomobject]@{
-                ip = $ip; path = $path; name = $name; model = $model; location = Tidy "$($a['printer-location'])"
-                formats = $formats; ok = ($formats -contains 'application/pdf' -or $formats -contains 'image/jpeg')
+                ip = $ip; url = $url; path = $path; name = $name; model = $model; location = Tidy "$($a['printer-location'])"
+                formats = $formats; ok = [bool](@($ycFormats | Where-Object { $formats -contains $_ }).Count)
+                pwgRes = @($a['pwg-raster-document-resolution-supported']); pwgTypes = @($a['pwg-raster-document-type-supported'])
+                urf = @($a['urf-supported'])
             }
-        }
+    }
     }
 }
 
@@ -470,14 +492,19 @@ function Find-Printers {
     $snmp = Snmp-Names $cands
     $net = @(foreach ($ip in $cands) {
         $p = @($ports[$ip])
-        $i = if ($p -contains 631 -or -not $p.Count) { Printer-Info $ip }
-        if ($i -and $i.ok) { if ($i.name -eq $ip -and $snmp[$ip]) { $i.name = $snmp[$ip] }; $i; continue }
-        if ($p -contains 9100) {
-            $n = if ($snmp[$ip]) { $snmp[$ip] } elseif ($i) { $i.name } else { "Impressora $ip" }
-            [pscustomobject]@{ ip = $ip; path = $null; name = $n; model = ''; location = 'porta 9100'; formats = @(); ok = $true; raw = $true }
-            continue
+        $i = Printer-Info $ip ($p -contains 631 -or -not $p.Count)
+        # diagnostico: o que cada aparelho respondeu
+        $diag = "    $ip  portas: $(if ($p.Count) { $p -join ',' } else { '-' })"
+        if ($snmp[$ip]) { $diag += "  snmp: $($snmp[$ip])" }
+        if ($i) { $diag += "  IPP ($($i.url)$($i.path)): $($i.formats -join ' ')" } elseif ($ycWhy[$ip]) { $diag += "  IPP falhou: $($ycWhy[$ip])" }
+        Write-Host $diag -ForegroundColor DarkGray
+        # IPP respondeu: e por ele (mesmo que nao aceite nada, nao manda nada as cegas na 9100)
+        if ($i) { if ($i.name -eq $ip -and $snmp[$ip]) { $i.name = $snmp[$ip] }; $i; continue }
+        # sem IPP, a 9100 recebe PCL - linguagem de laser. Jato de tinta (Epson, Canon...) imprimiria os comandos como texto
+        $n = if ($snmp[$ip]) { $snmp[$ip] } else { "Impressora $ip" }
+        if ($p -contains 9100 -and $n -notmatch 'epson|canon|ecotank|inkjet|deskjet|officejet|pixma|stylus') {
+            [pscustomobject]@{ ip = $ip; path = $null; name = $n; model = ''; location = 'porta 9100 (PCL)'; formats = @(); ok = $true; raw = $true }
         }
-        if ($i) { $i }
     })
     $net
     # o que a rede nao achou, imprime pela fila do Windows
@@ -611,14 +638,111 @@ public static class YcPcl {
         }
     }
 }
+
+// IPP seguro (porta 443): o certificado da impressora e autoassinado, aceita qualquer um (so rede local)
+public static class YcTls {
+    static bool Ok(object s, System.Security.Cryptography.X509Certificates.X509Certificate c,
+                   System.Security.Cryptography.X509Certificates.X509Chain ch, System.Net.Security.SslPolicyErrors e) { return true; }
+    public static readonly System.Net.Security.RemoteCertificateValidationCallback Any = Ok;
+}
+
+// PWG-raster (Mopria / IPP Everywhere) e URF (AirPrint): pagina A4 inteira em pixels, que qualquer
+// impressora com esses selos imprime sem driver. Mesma compressao nos dois: linhas repetidas + PackBits.
+public static class YcRaster {
+    static void Be(byte[] b, int at, int v) { b[at] = (byte)(v >> 24); b[at + 1] = (byte)(v >> 16); b[at + 2] = (byte)(v >> 8); b[at + 3] = (byte)v; }
+    static void Str(byte[] b, int at, string s) { byte[] t = Encoding.ASCII.GetBytes(s); Array.Copy(t, 0, b, at, t.Length); }
+    static bool Same(byte[] l, int a, int b, int bpp) { for (int k = 0; k < bpp; k++) if (l[a * bpp + k] != l[b * bpp + k]) return false; return true; }
+
+    public static byte[] Make(byte[] img, bool land, bool urf, int res, bool gray) {
+        int w = (int)Math.Round(210 / 25.4 * res), h = (int)Math.Round(297 / 25.4 * res), bpp = gray ? 1 : 3;
+        byte[] px; int stride;
+        using (MemoryStream ms = new MemoryStream(img)) using (Bitmap src = new Bitmap(ms)) using (Bitmap bmp = new Bitmap(w, h, PixelFormat.Format24bppRgb)) {
+            if (land) src.RotateFlip(RotateFlipType.Rotate90FlipNone);
+            using (Graphics g = Graphics.FromImage(bmp)) {
+                g.Clear(Color.White);
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                double k = Math.Min((double)w / src.Width, (double)h / src.Height);
+                int dw = (int)(src.Width * k), dh = (int)(src.Height * k);
+                g.DrawImage(src, (w - dw) / 2, (h - dh) / 2, dw, dh);
+            }
+            BitmapData d = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+            stride = d.Stride; px = new byte[stride * h];
+            System.Runtime.InteropServices.Marshal.Copy(d.Scan0, px, 0, px.Length);
+            bmp.UnlockBits(d);
+        }
+        MemoryStream o = new MemoryStream();
+        if (urf) {
+            byte[] f = new byte[12]; Str(f, 0, "UNIRAST"); Be(f, 8, 1); o.Write(f, 0, 12);
+            byte[] hd = new byte[32];
+            hd[0] = (byte)(bpp * 8); hd[1] = (byte)(gray ? 0 : 1); hd[2] = 1; hd[3] = 4;   // bits, sGray/sRGB, simplex, normal
+            Be(hd, 12, w); Be(hd, 16, h); Be(hd, 20, res);
+            o.Write(hd, 0, 32);
+        } else {
+            o.Write(Encoding.ASCII.GetBytes("RaS2"), 0, 4);
+            byte[] hd = new byte[1796];
+            Str(hd, 0, "PwgRaster");
+            Be(hd, 276, res); Be(hd, 280, res);           // HWResolution
+            Be(hd, 340, 1);                                 // NumCopies
+            Be(hd, 352, 595); Be(hd, 356, 842);             // PageSize em pontos (A4)
+            Be(hd, 372, w); Be(hd, 376, h);                 // largura/altura em pixels
+            Be(hd, 384, 8); Be(hd, 388, bpp * 8); Be(hd, 392, w * bpp);
+            Be(hd, 400, gray ? 18 : 19);                    // sGray / sRGB
+            Be(hd, 420, bpp);                               // NumColors
+            Be(hd, 452, 1); Be(hd, 456, 1); Be(hd, 460, 1); // TotalPageCount, CrossFeed/FeedTransform
+            Be(hd, 472, w); Be(hd, 476, h);                 // ImageBox
+            Be(hd, 480, 0xffffff);                          // AlternatePrimary
+            Str(hd, 1732, "iso_a4_210x297mm");
+            o.Write(hd, 0, hd.Length);
+        }
+        byte[] prev = null, line = new byte[w * bpp];
+        int rep = 0;
+        for (int y = 0; y <= h; y++) {
+            byte[] cur = null;
+            if (y < h) {
+                cur = new byte[w * bpp]; int off = y * stride;
+                for (int x = 0; x < w; x++) {
+                    int i = off + x * 3;   // Bitmap guarda BGR
+                    if (gray) cur[x] = (byte)((px[i] * 29 + px[i + 1] * 150 + px[i + 2] * 77) >> 8);
+                    else { cur[x * 3] = px[i + 2]; cur[x * 3 + 1] = px[i + 1]; cur[x * 3 + 2] = px[i]; }
+                }
+                if (prev != null && rep < 255 && System.Linq.Enumerable.SequenceEqual(cur, prev)) { rep++; continue; }
+            }
+            if (prev != null) {
+                o.WriteByte((byte)rep);
+                // ate onde a linha tem algo que nao e branco; o resto vira um 0x80 ("preenche de branco")
+                int end = w; while (end > 0) { bool white = true; for (int k = 0; k < bpp; k++) if (prev[(end - 1) * bpp + k] != 255) white = false; if (!white) break; end--; }
+                int x = 0;
+                while (x < end) {
+                    int run = 1; while (x + run < end && run < 128 && Same(prev, x, x + run, bpp)) run++;
+                    if (run > 1) { o.WriteByte((byte)(run - 1)); o.Write(prev, x * bpp, bpp); x += run; continue; }
+                    int start = x, cnt = 1; x++;
+                    while (x < end && cnt < 128 && !(x + 1 < end && Same(prev, x, x + 1, bpp))) { cnt++; x++; }
+                    o.WriteByte((byte)(cnt == 1 ? 0 : 257 - cnt)); o.Write(prev, start * bpp, cnt * bpp);
+                }
+                if (end < w) o.WriteByte(0x80);
+            }
+            prev = cur; rep = 0;
+        }
+        return o.ToArray();
+    }
+}
 '@
 
+function Load-Cs {
+    if ('YcPcl' -as [type]) { return }
+    Add-Type -AssemblyName System.Drawing
+    $refs = if ($PSVersionTable.PSEdition -eq 'Core') {
+        # PowerShell 7: usar um Bitmap carrega as partes do GDI+, que tambem precisam ser referenciadas
+        (New-Object Drawing.Bitmap 1, 1).Dispose()
+        @('System.Drawing', 'System.Drawing.Primitives', 'System.Drawing.Common', 'System.Linq', 'System.Net.Security', 'System.Net.Primitives',
+          'System.Security.Cryptography.X509Certificates', 'System.Security.Cryptography') +
+        @([AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.Location -and $_.GetName().Name -match '^System\.Private\.Windows' } | ForEach-Object { $_.Location })
+    } else { 'System.Drawing', 'System.Core' }
+    Add-Type -TypeDefinition $ycPcl -ReferencedAssemblies $refs -ErrorAction Stop
+}
+
 function Send-Raw([string]$ip, [byte[]]$jpg, [bool]$land) {
-    if (-not ('YcPcl' -as [type])) {
-        Add-Type -AssemblyName System.Drawing
-        try { Add-Type -TypeDefinition $ycPcl -ReferencedAssemblies System.Drawing }
-        catch { Add-Type -TypeDefinition $ycPcl -ReferencedAssemblies System.Drawing, System.Drawing.Primitives, System.Drawing.Common }
-    }
+    Load-Cs
     $data = [YcPcl]::Make($jpg, $land)
     $c = New-Object Net.Sockets.TcpClient
     try {
@@ -642,13 +766,28 @@ function Send-Ficha([string]$html, [bool]$land, [string]$ip) {
         Write-Host ("  Ficha enviada para {0} ({1}, porta 9100)" -f $t.name, $t.ip) -ForegroundColor Green
         return @{ ok = $true; detail = $t.name }
     }
-    $pdf = $t.formats -contains 'application/pdf'
     if (-not $t.ok) { return @{ ok = $false; code = 'formato'; detail = "$($t.name): $($t.formats -join ', ')" } }
-    $doc = Render $html $pdf $land
+    $fmt = $ycFormats | Where-Object { $t.formats -contains $_ } | Select-Object -First 1
     $job = [ordered]@{ 'media' = @(0x44, 'iso_a4_210x297mm') }
-    if (-not $pdf) { $job['print-scaling'] = @(0x44, 'fit'); $job['orientation-requested'] = @(0x23, $(if ($land) { 4 } else { 3 })) }
-    $fmt = if ($pdf) { 'application/pdf' } else { 'image/jpeg' }
-    $r = Ipp-Call $t.ip $t.path 0x0002 ([ordered]@{ 'job-name' = @(0x42, 'Ficha Tecnica'); 'document-format' = @(0x49, $fmt) }) $job $doc 60000
+    if ($fmt -eq 'application/pdf') { $doc = Render $html $true $land }
+    elseif ($fmt -eq 'image/jpeg') {
+        $doc = Render $html $false $land
+        $job['print-scaling'] = @(0x44, 'fit'); $job['orientation-requested'] = @(0x23, $(if ($land) { 4 } else { 3 }))
+    } else {
+        # raster: escolhe resolucao (300 dpi se tiver, senao a menor oferecida) e cor (sRGB se tiver, senao cinza)
+        $urf = $fmt -eq 'image/urf'
+        if ($urf) {
+            $rs = @(($t.urf | Where-Object { $_ -match '^RS' }) -replace '^RS' -split '-' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ })
+            $gray = -not ($t.urf -match '^SRGB24$')
+        } else {
+            $rs = @($t.pwgRes | ForEach-Object { [int](($_ -split 'x')[0]) })
+            $gray = $t.pwgTypes -notcontains 'srgb_8'
+        }
+        $res = if ($rs -contains 300) { 300 } elseif ($rs.Count) { ($rs | Sort-Object)[0] } else { 300 }
+        Load-Cs
+        $doc = [YcRaster]::Make((Render $html $false $land), $land, $urf, $res, $gray)
+    }
+    $r = Ipp-Call $t.url $t.path 0x0002 ([ordered]@{ 'job-name' = @(0x42, 'Ficha Tecnica'); 'document-format' = @(0x49, $fmt) }) $job $doc 60000
     if ($r.status -ge 0x100) { return @{ ok = $false; code = 'recusou'; detail = ('{0} (codigo 0x{1:x4})' -f $t.name, $r.status) } }
     Write-Host ("  Ficha enviada para {0} ({1})" -f $t.name, $t.ip) -ForegroundColor Green
     @{ ok = $true; detail = $t.name }
@@ -681,7 +820,7 @@ button[hidden]{display:none}
 <script>
 var MSG = {
   'sem-impressora': 'Nenhuma impressora encontrada na rede. Confira se ela est\u00e1 ligada e na mesma rede desta m\u00e1quina.',
-  'formato': 'Esta impressora n\u00e3o aceita PDF nem imagem pela rede.',
+  'formato': 'Esta impressora n\u00e3o aceita nenhum formato que a ficha gera (PDF, PWG, URF ou JPEG).',
   'recusou': 'A impressora recusou a ficha.',
   'navegador': 'N\u00e3o foi poss\u00edvel gerar a ficha (Edge n\u00e3o encontrado).',
   'erro': 'Erro ao enviar para a impressora.'
@@ -718,7 +857,7 @@ function load(fresh) {
       row.className = 'p' + (p.ok ? '' : ' off');
       inp.type = 'radio'; inp.name = 'p'; inp.value = p.ip; inp.disabled = !p.ok; inp.checked = p === sel;
       txt.appendChild(el('b', p.name));
-      txt.appendChild(el('small', [p.model !== p.name ? p.model : '', p.location, p.ip.indexOf('win:') ? p.ip : ''].filter(Boolean).join(' \u00b7 ') + (p.ok ? '' : ' \u2014 n\u00e3o aceita PDF nem imagem')));
+      txt.appendChild(el('small', [p.model !== p.name ? p.model : '', p.location, p.ip.indexOf('win:') ? p.ip : ''].filter(Boolean).join(' \u00b7 ') + (p.ok ? '' : ' \u2014 formato n\u00e3o suportado')));
       row.appendChild(inp); row.appendChild(txt); list.appendChild(row);
     });
     show(ps.length === 1 ? 'Impressora encontrada:' : 'Escolha a impressora:');
@@ -807,7 +946,7 @@ $found = @(Get-Printers $true)
 foreach ($p in $found) {
     if ($p.win) { Write-Host ("  - {0} ({1})" -f $p.name, $p.location) -ForegroundColor Green }
     elseif ($p.ok) { Write-Host ("  - {0} ({1})" -f $p.name, $p.ip) -ForegroundColor Green }
-    else { Write-Host ("  - {0} ({1}) - nao aceita PDF nem imagem" -f $p.name, $p.ip) -ForegroundColor DarkGray }
+    else { Write-Host ("  - {0} ({1}) - formato nao suportado" -f $p.name, $p.ip) -ForegroundColor DarkGray }
 }
 if (-not $found.Count) { Write-Host '  Nenhuma impressora encontrada agora (da para procurar de novo na hora de imprimir).' -ForegroundColor Yellow }
 Write-Host ''
