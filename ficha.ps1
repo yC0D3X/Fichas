@@ -830,7 +830,7 @@ h1{font-size:20px;margin:0 0 12px}
 #msg small{display:block;opacity:.7;margin-top:6px}
 #list{text-align:left;margin:0 0 16px}
 .p{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;margin:0 0 8px;border:1px solid #333;border-radius:8px;cursor:pointer}
-.p:has(input:checked){border-color:#2f81f7;background:#16233a}
+.p:has(input:checked){border-color:#b6ffb6;background:#202c20}
 .p.off{opacity:.45;cursor:not-allowed}
 .p input{margin:3px 0 0}
 .p b{display:block}
