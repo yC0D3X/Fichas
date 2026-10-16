@@ -292,6 +292,7 @@ function Ipp-Call([string]$ip, [string]$path, [int]$op, $opAttrs, $jobAttrs, [by
     $body = $l.ToArray()
     $rq = [Net.HttpWebRequest]::Create("http://${ip}:631$path")
     $rq.Method = 'POST'; $rq.ContentType = 'application/ipp'; $rq.Timeout = $timeout; $rq.ReadWriteTimeout = $timeout
+    $rq.Proxy = $null   # impressora e local: proxy da empresa so atrapalha
     $rq.ContentLength = $body.Length
     $s = $rq.GetRequestStream(); $s.Write($body, 0, $body.Length); $s.Close()
     $rs = $rq.GetResponse(); $ms = New-Object IO.MemoryStream; $rs.GetResponseStream().CopyTo($ms); $rs.Close()
@@ -319,24 +320,175 @@ function Printer-Info([string]$ip) {
     }
 }
 
-# varre a rede local (/24 de cada placa) atras de quem responde na porta 631
-function Find-Printers {
-    $bases = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
-        $_.PrefixLength -ge 16 -and $_.PrefixLength -le 30 -and $_.IPAddress -notmatch '^(127|169\.254)\.'
-    } | ForEach-Object { ($_.IPAddress -split '\.')[0..2] -join '.' } | Select-Object -Unique)
-    $socks = New-Object Collections.ArrayList
-    foreach ($b in $bases) {
-        for ($h = 1; $h -le 254; $h++) {
-            $c = New-Object Net.Sockets.TcpClient
-            [void]$socks.Add([pscustomobject]@{ ip = "$b.$h"; c = $c; t = $c.ConnectAsync("$b.$h", 631) })
+function To-IPv4([string]$h) {
+    if (-not $h) { return }
+    if ($h -match '^\d{1,3}(\.\d{1,3}){3}$') { return $h }
+    Try-Get { [Net.Dns]::GetHostAddresses($h) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString } | Select-Object -First 1 }
+}
+
+# impressoras fisicas ja instaladas no Windows (tira PDF, XPS, OneNote, fax), com o IP quando der para saber
+function Installed-Printers {
+    # WSD (ex.: "EPSONA9C00A (M3170 Series)"): o endereco fica no LocationInformation do dispositivo
+    $wsd = @{}
+    foreach ($k in @(Try-Get { Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\DAFWSDProvider' -ErrorAction SilentlyContinue })) {
+        $v = Try-Get { Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue }
+        if ("$($v.LocationInformation)" -match '//(\d{1,3}(\.\d{1,3}){3})') { $wsd["$($v.FriendlyName)"] = $Matches[1] }
+    }
+    $ports = @{}
+    foreach ($p in @(Try-Get { Get-PrinterPort })) { if ($p.PrinterHostAddress) { $ports[$p.Name] = $p.PrinterHostAddress } }
+    foreach ($p in @(Try-Get { Get-Printer })) {
+        if ("$($p.DriverName) $($p.PortName) $($p.Name)" -match 'PDF|XPS|OneNote|Fax|PORTPROMPT|^nul:|FILE:') { continue }
+        $ip = $null
+        if ($ports[$p.PortName]) { $ip = To-IPv4 $ports[$p.PortName] }
+        elseif ($wsd[$p.Name]) { $ip = $wsd[$p.Name] }
+        elseif ($p.PortName -match '^IP_(\d{1,3}(\.\d{1,3}){3})') { $ip = $Matches[1] }
+        [pscustomobject]@{ name = $p.Name; driver = $p.DriverName; ip = $ip }
+    }
+    # WSD sem impressora com o mesmo nome: o IP ainda serve para procurar por IPP
+    foreach ($n in $wsd.Keys) { [pscustomobject]@{ name = $null; driver = $null; ip = $wsd[$n] } }
+}
+
+function Ip-Num([string]$ip) { $b = ([Net.IPAddress]$ip).GetAddressBytes(); [uint32]$b[0] * 16777216 + [uint32]$b[1] * 65536 + [uint32]$b[2] * 256 + $b[3] }
+function Num-Ip([uint32]$n) { '{0}.{1}.{2}.{3}' -f ($n -shr 24), (($n -shr 16) -band 255), (($n -shr 8) -band 255), ($n -band 255) }
+
+# IPs de todas as faixas de rede desta maquina (faixa maior que /22 fica so na /22 em volta do IP)
+function Lan-Hosts {
+    $mine = @(); $all = @()
+    foreach ($a in @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127|169\.254)\.' -and $_.PrefixLength -le 30 })) {
+        $mine += $a.IPAddress
+        $pl = [Math]::Max([int]$a.PrefixLength, 22)
+        $mask = [uint32]([Math]::Pow(2, 32) - [Math]::Pow(2, 32 - $pl))
+        $net = (Ip-Num $a.IPAddress) -band $mask
+        for ($n = $net + 1; $n -lt $net + [Math]::Pow(2, 32 - $pl) - 1; $n++) { $all += Num-Ip $n }
+    }
+    @($all | Select-Object -Unique | Where-Object { $mine -notcontains $_ })
+}
+
+# WS-Discovery: o mesmo "quem e impressora ai?" que o Windows grita na rede (acha as WSD, ex.: EPSONA9C00A)
+function Wsd-Probe {
+    $xml = '<?xml version="1.0" encoding="utf-8"?><soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:wprt="http://schemas.microsoft.com/windows/2006/08/wdp/print"><soap:Header><wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To><wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action><wsa:MessageID>urn:uuid:' + [guid]::NewGuid() + '</wsa:MessageID></soap:Header><soap:Body><wsd:Probe><wsd:Types>wprt:PrintDeviceType</wsd:Types></wsd:Probe></soap:Body></soap:Envelope>'
+    $b = [Text.Encoding]::UTF8.GetBytes($xml)
+    $dst = New-Object Net.IPEndPoint ([Net.IPAddress]::Parse('239.255.255.250'), 3702)
+    # um socket por placa, senao o multicast so sai pela placa padrao
+    foreach ($a in @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127|169\.254)\.' })) {
+        $u = Try-Get { New-Object Net.Sockets.UdpClient (New-Object Net.IPEndPoint ([Net.IPAddress]::Parse($a.IPAddress), 0)) }
+        if ($u) { [void](Try-Get { $u.Send($b, $b.Length, $dst) }); $u }
+    }
+}
+
+function Wsd-Read($socks) {
+    foreach ($u in $socks) {
+        while ($u.Available -gt 0) {
+            $ep = New-Object Net.IPEndPoint ([Net.IPAddress]::Any, 0)
+            $d = Try-Get { $u.Receive([ref]$ep) }
+            if (-not $d) { break }
+            $t = [Text.Encoding]::UTF8.GetString($d)
+            if ($t -notmatch 'ProbeMatch') { continue }
+            [regex]::Matches($t, 'https?://(\d{1,3}(\.\d{1,3}){3})') | ForEach-Object { $_.Groups[1].Value }
+            $ep.Address.ToString()
         }
     }
+}
+
+# nome do aparelho por SNMP (hrDeviceDescr.1, comunidade public) - serve para quem nao fala IPP
+function Snmp-Names([string[]]$ips) {
+    $names = @{}
+    if (-not $ips) { return $names }
+    $oid = [byte[]](0x06, 0x0b, 0x2b, 6, 1, 2, 1, 0x19, 3, 2, 1, 3, 1)
+    $pkt = [byte[]](0x30, 0x29, 2, 1, 0, 4, 6) + [Text.Encoding]::ASCII.GetBytes('public') +
+           [byte[]](0xa0, 0x1c, 2, 1, 1, 2, 1, 0, 2, 1, 0, 0x30, 0x11, 0x30, 0x0f) + $oid + [byte[]](5, 0)
+    $pkt = [byte[]]$pkt
+    $u = New-Object Net.Sockets.UdpClient 0
+    # sem isso, um "porta fechada" (ICMP) de um IP derruba a leitura dos outros
+    [void](Try-Get { $u.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) })
+    foreach ($ip in $ips) { [void](Try-Get { $u.Send($pkt, $pkt.Length, $ip, 161) }) }
     $end = (Get-Date).AddMilliseconds(1500)
-    while ((Get-Date) -lt $end -and @($socks | Where-Object { -not $_.t.IsCompleted }).Count) { Start-Sleep -Milliseconds 100 }
-    $open = @($socks | Where-Object { $_.t.Status -eq 'RanToCompletion' } | ForEach-Object { $_.ip })
-    foreach ($s in $socks) { $s.c.Close() }
-    if ($ycPrinter -and $open -notcontains $ycPrinter) { $open += $ycPrinter }
-    foreach ($ip in $open) { Printer-Info $ip }
+    while ((Get-Date) -lt $end -and $names.Count -lt $ips.Count) {
+        if ($u.Available -le 0) { Start-Sleep -Milliseconds 50; continue }
+        $ep = New-Object Net.IPEndPoint ([Net.IPAddress]::Any, 0)
+        $d = Try-Get { $u.Receive([ref]$ep) }
+        if (-not $d) { continue }
+        # acha o OID na resposta e le o texto (OCTET STRING) logo depois
+        for ($i = 0; $i -le $d.Length - $oid.Length - 2; $i++) {
+            $hit = $true
+            for ($j = 0; $j -lt $oid.Length; $j++) { if ($d[$i + $j] -ne $oid[$j]) { $hit = $false; break } }
+            if (-not $hit) { continue }
+            $k = $i + $oid.Length
+            if ($d[$k] -ne 4) { break }
+            $len = [int]$d[$k + 1]; $k += 2
+            if ($len -band 0x80) { $nb = $len -band 0x7f; $len = 0; for ($j = 0; $j -lt $nb; $j++) { $len = $len * 256 + $d[$k + $j] }; $k += $nb }
+            $s = Tidy ([Text.Encoding]::UTF8.GetString($d, $k, [Math]::Min($len, $d.Length - $k)))
+            if ($s) { $names[$ep.Address.ToString()] = $s }
+            break
+        }
+    }
+    $u.Close()
+    $names
+}
+
+# procura toda e qualquer impressora na rede desta maquina:
+#  - varre a faixa inteira nas portas de impressora: 631 (IPP), 9100 (RAW/JetDirect) e 515 (LPD)
+#  - pergunta por WS-Discovery (impressoras WSD respondem mesmo com a varredura bloqueada)
+#  - soma as impressoras ja instaladas no Windows (podem estar em outra faixa)
+# Quem aceita IPP recebe PDF/imagem; quem so tem a 9100 recebe a ficha em PCL; o resto vai pela fila do Windows.
+function Find-Printers {
+    $inst = @(Installed-Printers)
+    $hosts = Lan-Hosts
+    $wsd = @(Wsd-Probe)
+    $socks = New-Object Collections.ArrayList
+    foreach ($port in 631, 9100, 515) {
+        foreach ($ip in $hosts) {
+            $c = New-Object Net.Sockets.TcpClient
+            [void]$socks.Add([pscustomobject]@{ ip = $ip; port = $port; c = $c; t = $c.ConnectAsync($ip, $port) })
+        }
+    }
+    # impressora em Wi-Fi as vezes demora para acordar
+    $found = @()
+    $end = (Get-Date).AddMilliseconds(3000)
+    while ((Get-Date) -lt $end) {
+        $found += @(Wsd-Read $wsd)
+        if (-not @($socks | Where-Object { -not $_.t.IsCompleted }).Count) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    $found += @(Wsd-Read $wsd)
+    foreach ($u in $wsd) { $u.Close() }
+    $ports = @{}
+    foreach ($s in $socks) {
+        if ($s.t.Status -eq 'RanToCompletion') { $ports[$s.ip] = @(@($ports[$s.ip] | Where-Object { $_ }) + $s.port) }
+        $s.c.Close()
+    }
+    # quem esta fora da faixa varrida (WSD, instalada, $ycPrinter): testa as portas so dele
+    $extra = @(@($ycPrinter) + $found + @($inst | ForEach-Object { $_.ip }) | Where-Object { $_ -and $hosts -notcontains $_ } | Select-Object -Unique)
+    foreach ($ip in $extra) {
+        $ports[$ip] = @(foreach ($port in 631, 9100) {
+            $c = New-Object Net.Sockets.TcpClient
+            if ((Try-Get { $c.ConnectAsync($ip, $port).Wait(1500) }) -and $c.Connected) { $port }
+            $c.Close()
+        })
+    }
+    $cands = @($ports.Keys | Where-Object { @($ports[$_]).Count -or $found -contains $_ })
+    $snmp = Snmp-Names $cands
+    $net = @(foreach ($ip in $cands) {
+        $p = @($ports[$ip])
+        $i = if ($p -contains 631 -or -not $p.Count) { Printer-Info $ip }
+        if ($i -and $i.ok) { if ($i.name -eq $ip -and $snmp[$ip]) { $i.name = $snmp[$ip] }; $i; continue }
+        if ($p -contains 9100) {
+            $n = if ($snmp[$ip]) { $snmp[$ip] } elseif ($i) { $i.name } else { "Impressora $ip" }
+            [pscustomobject]@{ ip = $ip; path = $null; name = $n; model = ''; location = 'porta 9100'; formats = @(); ok = $true; raw = $true }
+            continue
+        }
+        if ($i) { $i }
+    })
+    $net
+    # o que a rede nao achou, imprime pela fila do Windows
+    foreach ($p in $inst) {
+        if (-not $p.name -or ($p.ip -and @($net | Where-Object { $_ -and $_.ip -eq $p.ip }).Count)) { continue }
+        [pscustomobject]@{
+            ip = "win:$($p.name)"; path = $null; name = $p.name; model = $p.driver
+            location = $(if ($p.ip) { "$($p.ip) - pelo Windows" } else { 'instalada no Windows' })
+            formats = @(); ok = $true; win = $true
+        }
+    }
 }
 
 # lista de impressoras da rede (guardada; $fresh = procura de novo)
@@ -384,10 +536,112 @@ function Render([string]$html, [bool]$pdf, [bool]$land) {
     , $ms.ToArray()
 }
 
+# impressora instalada no Windows: desenha a imagem A4 da ficha e manda pela fila dela, sem dialogo
+function Print-Windows([string]$printer, [byte[]]$jpg, [bool]$land) {
+    Add-Type -AssemblyName System.Drawing
+    $ms = New-Object IO.MemoryStream (, $jpg)
+    $script:ycImg = [Drawing.Image]::FromStream($ms)
+    $pd = New-Object Drawing.Printing.PrintDocument
+    try {
+        $pd.PrinterSettings.PrinterName = $printer
+        if (-not $pd.PrinterSettings.IsValid) { throw "impressora '$printer' nao encontrada no Windows" }
+        $pd.DocumentName = 'Ficha Tecnica'
+        $pd.PrintController = New-Object Drawing.Printing.StandardPrintController
+        $pd.DefaultPageSettings.Landscape = $land
+        $a4 = $pd.PrinterSettings.PaperSizes | Where-Object { $_.Kind -eq 'A4' } | Select-Object -First 1
+        if ($a4) { $pd.DefaultPageSettings.PaperSize = $a4 }
+        $pd.add_PrintPage({
+            param($s, $e)
+            # origem ja fica na area imprimivel; encaixa a folha nela sem distorcer
+            $w = $e.PageBounds.Width - 2 * $e.PageSettings.HardMarginX
+            $h = $e.PageBounds.Height - 2 * $e.PageSettings.HardMarginY
+            $img = $script:ycImg
+            $k = [Math]::Min($w / $img.Width, $h / $img.Height)
+            $dw = $img.Width * $k; $dh = $img.Height * $k
+            $e.Graphics.InterpolationMode = 'HighQualityBicubic'
+            $e.Graphics.DrawImage($img, [float](($w - $dw) / 2), [float](($h - $dh) / 2), [float]$dw, [float]$dh)
+            $e.HasMorePages = $false
+        })
+        $pd.Print()
+    } finally { $pd.Dispose(); $script:ycImg.Dispose(); $ms.Dispose() }
+}
+
+# impressora so com a porta 9100: a imagem da ficha vira PCL (preto e branco, 300 dpi, meio-tom pontilhado)
+$ycPcl = @'
+using System; using System.Drawing; using System.Drawing.Imaging; using System.IO; using System.Text;
+public static class YcPcl {
+    static void W(Stream o, string s) { byte[] b = Encoding.ASCII.GetBytes(s); o.Write(b, 0, b.Length); }
+    public static byte[] Make(byte[] img, bool land) {
+        using (MemoryStream ms = new MemoryStream(img)) using (Bitmap src = new Bitmap(ms)) {
+            if (land) src.RotateFlip(RotateFlipType.Rotate90FlipNone);
+            // area que cabe na folha A4 de qualquer impressora (margem ~5 mm)
+            int w = 2304, h = 3300;
+            double k = Math.Min((double)w / src.Width, (double)h / src.Height);
+            int dw = (int)(src.Width * k), dh = (int)(src.Height * k);
+            using (Bitmap bmp = new Bitmap(w, h, PixelFormat.Format24bppRgb)) {
+                using (Graphics g = Graphics.FromImage(bmp)) {
+                    g.Clear(Color.White);
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.DrawImage(src, (w - dw) / 2, 0, dw, dh);
+                }
+                BitmapData d = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+                byte[] px = new byte[d.Stride * h];
+                System.Runtime.InteropServices.Marshal.Copy(d.Scan0, px, 0, px.Length);
+                int stride = d.Stride;
+                bmp.UnlockBits(d);
+                int[] bayer = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+                MemoryStream o = new MemoryStream();
+                W(o, "\u001b%-12345X@PJL JOB NAME=\"Ficha Tecnica\"\r\n@PJL ENTER LANGUAGE=PCL\r\n");
+                W(o, "\u001bE\u001b&l26A\u001b&l0O\u001b&l0E\u001b*t300R\u001b*p0x60Y\u001b*r0F\u001b*r" + w + "S\u001b*r1A\u001b*b0M");
+                int rb = w / 8; byte[] row = new byte[rb];
+                for (int y = 0; y < h; y++) {
+                    Array.Clear(row, 0, rb);
+                    int off = y * stride;
+                    for (int x = 0; x < w; x++) {
+                        int i = off + x * 3;
+                        int lum = (px[i] * 29 + px[i + 1] * 150 + px[i + 2] * 77) >> 8;
+                        if (lum < bayer[(y & 3) * 4 + (x & 3)] * 16 + 8) row[x >> 3] |= (byte)(0x80 >> (x & 7));
+                    }
+                    int n = rb; while (n > 0 && row[n - 1] == 0) n--;
+                    W(o, "\u001b*b" + n + "W"); o.Write(row, 0, n);
+                }
+                W(o, "\u001b*rC\u001bE\u001b%-12345X@PJL EOJ\r\n\u001b%-12345X");
+                return o.ToArray();
+            }
+        }
+    }
+}
+'@
+
+function Send-Raw([string]$ip, [byte[]]$jpg, [bool]$land) {
+    if (-not ('YcPcl' -as [type])) {
+        Add-Type -AssemblyName System.Drawing
+        try { Add-Type -TypeDefinition $ycPcl -ReferencedAssemblies System.Drawing }
+        catch { Add-Type -TypeDefinition $ycPcl -ReferencedAssemblies System.Drawing, System.Drawing.Primitives, System.Drawing.Common }
+    }
+    $data = [YcPcl]::Make($jpg, $land)
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        $c.SendTimeout = 60000
+        if (-not $c.ConnectAsync($ip, 9100).Wait(5000)) { throw "a impressora $ip nao atendeu na porta 9100" }
+        $s = $c.GetStream(); $s.Write($data, 0, $data.Length); $s.Flush()
+    } finally { $c.Close() }
+}
+
 function Send-Ficha([string]$html, [bool]$land, [string]$ip) {
     # so imprime numa impressora que a busca encontrou (a pagina nao escolhe um IP qualquer)
     $t = Get-Printers $false | Where-Object { $_.ip -eq $ip } | Select-Object -First 1
     if (-not $t) { return @{ ok = $false; code = 'sem-impressora'; detail = $ip } }
+    if ($t.win) {
+        Print-Windows $t.name (Render $html $false $land) $land
+        Write-Host ("  Ficha enviada para {0} (pelo Windows)" -f $t.name) -ForegroundColor Green
+        return @{ ok = $true; detail = $t.name }
+    }
+    if ($t.raw) {
+        Send-Raw $t.ip (Render $html $false $land) $land
+        Write-Host ("  Ficha enviada para {0} ({1}, porta 9100)" -f $t.name, $t.ip) -ForegroundColor Green
+        return @{ ok = $true; detail = $t.name }
+    }
     $pdf = $t.formats -contains 'application/pdf'
     if (-not $t.ok) { return @{ ok = $false; code = 'formato'; detail = "$($t.name): $($t.formats -join ', ')" } }
     $doc = Render $html $pdf $land
@@ -464,7 +718,7 @@ function load(fresh) {
       row.className = 'p' + (p.ok ? '' : ' off');
       inp.type = 'radio'; inp.name = 'p'; inp.value = p.ip; inp.disabled = !p.ok; inp.checked = p === sel;
       txt.appendChild(el('b', p.name));
-      txt.appendChild(el('small', [p.model !== p.name ? p.model : '', p.location, p.ip].filter(Boolean).join(' \u00b7 ') + (p.ok ? '' : ' \u2014 n\u00e3o aceita PDF nem imagem')));
+      txt.appendChild(el('small', [p.model !== p.name ? p.model : '', p.location, p.ip.indexOf('win:') ? p.ip : ''].filter(Boolean).join(' \u00b7 ') + (p.ok ? '' : ' \u2014 n\u00e3o aceita PDF nem imagem')));
       row.appendChild(inp); row.appendChild(txt); list.appendChild(row);
     });
     show(ps.length === 1 ? 'Impressora encontrada:' : 'Escolha a impressora:');
@@ -551,7 +805,8 @@ try { $listener.Start() } catch {
 Write-Host '  Impressao na rede: procurando impressoras...' -ForegroundColor Gray
 $found = @(Get-Printers $true)
 foreach ($p in $found) {
-    if ($p.ok) { Write-Host ("  - {0} ({1})" -f $p.name, $p.ip) -ForegroundColor Green }
+    if ($p.win) { Write-Host ("  - {0} ({1})" -f $p.name, $p.location) -ForegroundColor Green }
+    elseif ($p.ok) { Write-Host ("  - {0} ({1})" -f $p.name, $p.ip) -ForegroundColor Green }
     else { Write-Host ("  - {0} ({1}) - nao aceita PDF nem imagem" -f $p.name, $p.ip) -ForegroundColor DarkGray }
 }
 if (-not $found.Count) { Write-Host '  Nenhuma impressora encontrada agora (da para procurar de novo na hora de imprimir).' -ForegroundColor Yellow }
