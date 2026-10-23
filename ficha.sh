@@ -357,8 +357,11 @@ if [ -n "$YC_NOOPEN" ]; then printf '%s\n' "$JSON"; exit 0; fi
 
 CODE="$(printf '%s' "$JSON" | base64 | tr -d '\n=' | tr '+/' '-_')"
 
+# ---------- codigo (sempre mostrado, com ou sem o endereco do site) ----------
+printf '\n  \033[33mCodigo da ficha (cole em "Importar codigo manualmente" na ficha, se precisar):\033[0m\n\n%s\n\n' "$CODE" >&2
+
 if [ -z "$SITE" ]; then
-    printf '\n  Endereco do site nao informado. Copie o codigo abaixo e cole em "Importar codigo" na ficha:\n\n%s\n\n' "$CODE" >&2
+    printf '  Endereco do site nao informado: o site nao sera aberto.\n\n' >&2
     exit 0
 fi
 
