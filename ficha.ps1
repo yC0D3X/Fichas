@@ -204,11 +204,16 @@ $code = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd
 
 if ($ycNoOpen) { $json; return }
 
+# ---------- Codigo (sempre mostrado, com ou sem o endereco do site) ----------
+Write-Host ''
+Write-Host '  Codigo da ficha (cole em "Importar codigo manualmente" na ficha, se precisar):' -ForegroundColor Yellow
+Write-Host ''
+Write-Host $code
+Write-Host ''
+
 if (-not $ycSite) {
+    Write-Host '  Endereco do site nao informado: o site nao sera aberto.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '  Endereco do site nao informado. Copie o codigo abaixo e cole em "Importar codigo" na ficha:' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host $code
     return
 }
 
