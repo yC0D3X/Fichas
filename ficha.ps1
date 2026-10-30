@@ -550,9 +550,28 @@ function Get-Printers([bool]$fresh) {
 }
 
 function Find-Browser {
-    foreach ($p in @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-                     "$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
-                     "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe")) { if ($p -and (Test-Path $p)) { return $p } }
+    # registro: onde cada navegador Chromium informa o caminho real do executavel
+    foreach ($k in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\brave.exe',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\vivaldi.exe',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\opera.exe'
+    )) {
+        $p = Try-Get { (Get-ItemProperty $k -ErrorAction Stop).'(Default)' }
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    # fallback: caminhos conhecidos (cobre instalacoes por usuario)
+    foreach ($p in @(
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe",
+        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
+        "$env:LOCALAPPDATA\Vivaldi\Application\vivaldi.exe",
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+    )) { if ($p -and (Test-Path $p)) { return $p } }
 }
 
 # o Edge (sem janela) desenha a ficha: PDF igual ao Ctrl+P, ou uma imagem A4 em 300 dpi
