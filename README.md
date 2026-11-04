@@ -29,6 +29,9 @@ curl -fsSL https://raw.githubusercontent.com/yC0D3X/ficha/main/ficha.sh | bash -
 ## Observações
 
 - **Windows:** não precisa de administrador (a saúde da bateria vem do `powercfg /batteryreport`).
+- **Windows, verificação de carga:** em notebooks, a janela confere por 5 minutos, com o carregador
+  conectado, se a carga sobe. Imprimir e Enviar ficam travados até o resultado. Para mudar o tempo:
+  `$ycBatSeconds=60` antes do comando.
 - **Linux:** número de série e detalhes dos pentes de memória exigem root; o script
   pergunta antes de usar `sudo` (dá para responder "N" e seguir sem eles).
 - **macOS:** usa só ferramentas do sistema (`system_profiler`, `ioreg`, `diskutil`).

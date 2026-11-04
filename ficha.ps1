@@ -164,6 +164,121 @@ if ($wb) {
     $batt.charge = $wb.EstimatedChargeRemaining
 }
 
+# ---------- Verificacao de carga da bateria (so quando abre o site) ----------
+#  Com o carregador na tomada, compara a carga do inicio e do fim. O tempo so conta com o carregador
+#  conectado. No fim, abre o site com #bateria=... : a aba da ficha recebe o resultado e libera
+#  Imprimir/Enviar. Opcao (antes do comando):  $ycBatSeconds=60   (padrao: 300 segundos)
+$ycBatTest = $null
+if ($batt.present -and $ycSite -and -not $ycNoOpen) {
+    $ycBatTest = @{
+        id = [guid]::NewGuid().ToString('N')
+        seconds = $(if ([int]$ycBatSeconds -gt 0) { [int]$ycBatSeconds } else { 300 })
+        elapsed = 0.0; running = $false; done = $false; frame = 0
+        last = [DateTime]::UtcNow; drawn = [DateTime]::MinValue
+        from = $null; to = $null; mwh = $null
+    }
+    $batt.test = [ordered]@{ id = $ycBatTest.id; started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); seconds = $ycBatTest.seconds }
+}
+
+# abre o site por um arquivo HTML temporario: assim o link com os dados nunca e cortado
+function Open-Site([string]$fragment) {
+    $target = ($ycSite -split '#')[0] + $fragment
+    $launcher = Join-Path $env:TEMP 'ycodex-ficha.html'
+    $html = '<!doctype html><meta charset="utf-8"><title>yCODEX</title><script>location.replace(' + ($target | ConvertTo-Json) + ')</script>'
+    [IO.File]::WriteAllText($launcher, $html, (New-Object Text.UTF8Encoding $false))
+    Start-Process $launcher
+}
+
+# carregador conectado? ($null = nao deu para saber) e carga atual, em %. Soma todas as baterias.
+function Get-BatPower {
+    $o = @{ ac = $null; pct = $null }
+    $ps = Try-Get { Add-Type -AssemblyName System.Windows.Forms; [Windows.Forms.SystemInformation]::PowerStatus }
+    if ($ps) {
+        if ("$($ps.PowerLineStatus)" -eq 'Online') { $o.ac = $true } elseif ("$($ps.PowerLineStatus)" -eq 'Offline') { $o.ac = $false }
+        if ($ps.BatteryLifePercent -ge 0 -and $ps.BatteryLifePercent -le 1) { $o.pct = [int][math]::Round($ps.BatteryLifePercent * 100) }
+    }
+    if ($null -eq $o.ac -or $null -eq $o.pct) {
+        $w = @(Try-Get { Get-CimInstance Win32_Battery })
+        if ($w.Count -and $w[0]) {
+            if ($null -eq $o.ac) { $o.ac = -not ($w | Where-Object { $_.BatteryStatus -eq 1 }) }
+            if ($null -eq $o.pct) { $o.pct = [int][math]::Round(($w | Measure-Object EstimatedChargeRemaining -Average).Average) }
+        }
+    }
+    $o
+}
+
+# carga em mWh, quando o Windows deixa ler (sem administrador costuma falhar): enxerga subida menor que 1%
+function Get-BatMwh {
+    $t = 0.0
+    foreach ($x in @(Try-Get { Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus })) { if ($x) { $t += [double]$x.RemainingCapacity } }
+    if ($t -gt 0) { $t } else { $null }
+}
+
+# ok = subiu | full = ja estava cheia, nao da para testar | fail = nao subiu | unknown = nao deu para ler
+function Get-BatResult($from, $to, $mwhFrom, $mwhTo) {
+    if ($null -eq $from -or $null -eq $to) { return 'unknown' }
+    if ($to -gt $from -or ($mwhFrom -and $mwhTo -and ($mwhTo - $mwhFrom) -ge 200)) { return 'ok' }
+    if ($from -ge 95 -or $to -ge 95) { return 'full' }
+    'fail'
+}
+
+function Bat-Finish {
+    $t = $ycBatTest
+    $p = Get-BatPower
+    $t.to = $p.pct
+    $t.done = $true
+    $res = Get-BatResult $t.from $t.to $t.mwh (Get-BatMwh)
+    Write-Host ("`r" + (' ' * 62) + "`r") -NoNewline
+    $trail = if ($null -ne $t.from -and $null -ne $t.to) { "($($t.from)% -> $($t.to)%)" } else { '' }
+    switch ($res) {
+        'ok'      { Write-Host "  Bateria: SUBINDO CARGA $trail" -ForegroundColor Green }
+        'full'    { Write-Host "  Bateria: carga ja cheia, nao deu para testar se sobe $trail" -ForegroundColor Yellow }
+        'fail'    { Write-Host "  Bateria: NAO SUBIU CARGA $trail" -ForegroundColor Red
+                    Write-Host '  Verifique bateria, carregador, conector e limite de carga configurado no notebook.' -ForegroundColor Yellow }
+        'unknown' { Write-Host '  Bateria: nao foi possivel ler a carga.' -ForegroundColor Red }
+    }
+    $json = [ordered]@{ batResult = [ordered]@{ id = $t.id; result = $res; from = $t.from; to = $t.to; seconds = $t.seconds } } | ConvertTo-Json -Depth 3 -Compress
+    $rc = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    Write-Host ''
+    Write-Host '  Codigo do resultado (cole em "Importar codigo manualmente" se a ficha nao atualizar):' -ForegroundColor Yellow
+    Write-Host $rc
+    Write-Host ''
+    Open-Site ('#bateria=' + $rc)
+}
+
+# um passo da verificacao: desenha o spinner e, uma vez por segundo, le a energia. Nao bloqueia.
+function Bat-Tick {
+    $t = $ycBatTest
+    if (-not $t -or $t.done) { return }
+    $now = [DateTime]::UtcNow
+    if (($now - $t.drawn).TotalMilliseconds -lt 200) { return }
+    $t.drawn = $now
+    $dt = ($now - $t.last).TotalSeconds
+    if ($dt -ge 1 -or -not $t.frame) {
+        $t.last = $now
+        $p = Get-BatPower
+        if ($p.ac -eq $false) { $t.running = $false }
+        elseif (-not $t.running) { $t.running = $true; $t.elapsed = 0.0; $t.from = $p.pct; $t.mwh = Get-BatMwh }
+        # intervalo grande = notebook dormiu ou a janela estava ocupada: nao conta como teste
+        elseif ($dt -lt 10) { $t.elapsed += $dt }
+        if ($t.elapsed -ge $t.seconds) { Bat-Finish; return }
+    }
+    $sp = '|', '/', '-', '\'
+    $t.frame++
+    $c = $sp[$t.frame % 4]
+    if ($t.running) {
+        $left = [int][math]::Ceiling($t.seconds - $t.elapsed)
+        Write-Host ("`r  Verificando carga {0} {1:00}:{2:00}   nao feche esta janela   " -f $c, [math]::Floor($left / 60), ($left % 60)) -NoNewline -ForegroundColor Cyan
+    } else {
+        Write-Host ("`r  Conecte o carregador para continuar a verificacao {0}        " -f $c) -NoNewline -ForegroundColor Yellow
+    }
+}
+
+# sem a ponte de impressao nao ha outro laco: fica aqui ate acabar
+function Bat-Wait {
+    while ($ycBatTest -and -not $ycBatTest.done) { Bat-Tick; Start-Sleep -Milliseconds 200 }
+}
+
 # ---------- Teclado (layout configurado) ----------
 $kbd = Try-Get { ((Get-WinUserLanguageList)[0].InputMethodTips[0] -split ':')[1] }
 
@@ -217,16 +332,16 @@ if (-not $ycSite) {
     return
 }
 
-# abre o site por um arquivo HTML temporario: assim o link com os dados nunca e cortado
-$target = ($ycSite -split '#')[0] + '#ficha=' + $code
-$launcher = Join-Path $env:TEMP 'ycodex-ficha.html'
-$html = '<!doctype html><meta charset="utf-8"><title>yCODEX</title><script>location.replace(' + ($target | ConvertTo-Json) + ')</script>'
-[IO.File]::WriteAllText($launcher, $html, (New-Object Text.UTF8Encoding $false))
-Start-Process $launcher
+Open-Site ('#ficha=' + $code)
 
 Write-Host ''
 Write-Host '  Pronto! A ficha foi aberta no navegador.' -ForegroundColor Green
 Write-Host ''
+if ($ycBatTest) {
+    Write-Host ("  Bateria: verificando se sobe carga por {0} min. Imprimir e Enviar ficam travados ate o fim." -f [math]::Round($ycBatTest.seconds / 60, 1)) -ForegroundColor White
+    Write-Host ''
+    Bat-Tick
+}
 
 # =====================================================================
 #  Impressao na rede, sem instalar impressora
@@ -239,7 +354,7 @@ Write-Host ''
 #                              $ycPrinterMatch='M3170'    (ja deixa marcada a impressora com este nome/modelo)
 #                              $ycNoPrint=1               (nao abre a ponte)
 # =====================================================================
-if ($ycNoPrint) { return }
+if ($ycNoPrint) { Bat-Wait; return }
 $ycPort = 8631
 $ycList = $null
 [Net.ServicePointManager]::Expect100Continue = $false
@@ -987,6 +1102,7 @@ $listener = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback, $ycPo
 try { $listener.Start() } catch {
     Write-Host '  Impressao na rede: outra janela do comando ja esta cuidando disso.' -ForegroundColor DarkGray
     Write-Host ''
+    Bat-Wait
     return
 }
 
@@ -1004,6 +1120,7 @@ Write-Host '  Deixe esta janela aberta para usar "Imprimir na rede" na ficha. Pa
 Write-Host ''
 try {
     while ($true) {
+        Bat-Tick
         if (-not $listener.Pending()) { Start-Sleep -Milliseconds 150; continue }
         $client = $listener.AcceptTcpClient()
         try { Handle-Client $client } catch { } finally { $client.Close() }
