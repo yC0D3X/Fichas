@@ -168,18 +168,6 @@ if ($wb) {
 #  Com o carregador na tomada, compara a carga do inicio e do fim. O tempo so conta com o carregador
 #  conectado. No fim, abre o site com #bateria=... : a aba da ficha recebe o resultado e libera
 #  Imprimir/Enviar. Opcao (antes do comando):  $ycBatSeconds=60   (padrao: 300 segundos)
-$ycBatTest = $null
-if ($batt.present -and $ycSite -and -not $ycNoOpen) {
-    $ycBatTest = @{
-        id = [guid]::NewGuid().ToString('N')
-        seconds = $(if ([int]$ycBatSeconds -gt 0) { [int]$ycBatSeconds } else { 300 })
-        elapsed = 0.0; running = $false; done = $false; frame = 0
-        last = [DateTime]::UtcNow; drawn = [DateTime]::MinValue
-        from = $null; to = $null; mwh = $null
-    }
-    $batt.test = [ordered]@{ id = $ycBatTest.id; started = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); seconds = $ycBatTest.seconds }
-}
-
 # abre o site por um arquivo HTML temporario: assim o link com os dados nunca e cortado
 function Open-Site([string]$fragment) {
     $target = ($ycSite -split '#')[0] + $fragment
@@ -222,6 +210,25 @@ function Get-BatResult($from, $to, $mwhFrom, $mwhTo) {
     'fail'
 }
 
+function Bat-Code($obj) {
+    [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($obj | ConvertTo-Json -Depth 3 -Compress))).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+# marca o inicio da contagem (carga inicial + relogio)
+function Bat-Begin($p) {
+    $t = $ycBatTest
+    $t.from = $p.pct
+    $t.mwh = Get-BatMwh
+    $t.acSince = $null
+    $t.startedAt = [DateTimeOffset]::UtcNow
+}
+
+# o carregador foi conectado depois: avisa o site do novo inicio, para o contador dele recomecar junto
+function Bat-Sync {
+    $t = $ycBatTest
+    Open-Site ('#bateria=' + (Bat-Code ([ordered]@{ batSync = [ordered]@{ id = $t.id; started = $t.startedAt.ToUnixTimeMilliseconds() } })))
+}
+
 function Bat-Finish {
     $t = $ycBatTest
     $p = Get-BatPower
@@ -237,8 +244,7 @@ function Bat-Finish {
                     Write-Host '  Verifique bateria, carregador, conector e limite de carga configurado no notebook.' -ForegroundColor Yellow }
         'unknown' { Write-Host '  Bateria: nao foi possivel ler a carga.' -ForegroundColor Red }
     }
-    $json = [ordered]@{ batResult = [ordered]@{ id = $t.id; result = $res; from = $t.from; to = $t.to; seconds = $t.seconds } } | ConvertTo-Json -Depth 3 -Compress
-    $rc = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    $rc = Bat-Code ([ordered]@{ batResult = [ordered]@{ id = $t.id; result = $res; from = $t.from; to = $t.to; seconds = $t.seconds } })
     Write-Host ''
     Write-Host '  Codigo do resultado (cole em "Importar codigo manualmente" se a ficha nao atualizar):' -ForegroundColor Yellow
     Write-Host $rc
@@ -247,27 +253,29 @@ function Bat-Finish {
 }
 
 # um passo da verificacao: desenha o spinner e, uma vez por segundo, le a energia. Nao bloqueia.
+# O tempo vem do relogio, a partir do mesmo inicio que o site recebe: os dois contadores andam juntos.
 function Bat-Tick {
     $t = $ycBatTest
     if (-not $t -or $t.done) { return }
-    $now = [DateTime]::UtcNow
+    $now = [DateTimeOffset]::UtcNow
     if (($now - $t.drawn).TotalMilliseconds -lt 200) { return }
     $t.drawn = $now
-    $dt = ($now - $t.last).TotalSeconds
-    if ($dt -ge 1 -or -not $t.frame) {
+    if (($now - $t.last).TotalSeconds -ge 1) {
         $t.last = $now
         $p = Get-BatPower
-        if ($p.ac -eq $false) { $t.running = $false }
-        elseif (-not $t.running) { $t.running = $true; $t.elapsed = 0.0; $t.from = $p.pct; $t.mwh = Get-BatMwh }
-        # intervalo grande = notebook dormiu ou a janela estava ocupada: nao conta como teste
-        elseif ($dt -lt 10) { $t.elapsed += $dt }
-        if ($t.elapsed -ge $t.seconds) { Bat-Finish; return }
+        if ($p.ac -eq $false) { $t.startedAt = $null; $t.acSince = $null }
+        elseif (-not $t.startedAt) {
+            # espera o carregador firmar antes de recomecar: conector com mau contato nao abre aba sem parar
+            if (-not $t.acSince) { $t.acSince = $now }
+            elseif (($now - $t.acSince).TotalSeconds -ge 3) { Bat-Begin $p; Bat-Sync; $now = [DateTimeOffset]::UtcNow }
+        }
     }
+    if ($t.startedAt -and ($now - $t.startedAt).TotalSeconds -ge $t.seconds) { Bat-Finish; return }
     $sp = '|', '/', '-', '\'
     $t.frame++
     $c = $sp[$t.frame % 4]
-    if ($t.running) {
-        $left = [int][math]::Ceiling($t.seconds - $t.elapsed)
+    if ($t.startedAt) {
+        $left = [int][math]::Ceiling($t.seconds - ($now - $t.startedAt).TotalSeconds)
         Write-Host ("`r  Verificando carga {0} {1:00}:{2:00}   nao feche esta janela   " -f $c, [math]::Floor($left / 60), ($left % 60)) -NoNewline -ForegroundColor Cyan
     } else {
         Write-Host ("`r  Conecte o carregador para continuar a verificacao {0}        " -f $c) -NoNewline -ForegroundColor Yellow
@@ -277,6 +285,20 @@ function Bat-Tick {
 # sem a ponte de impressao nao ha outro laco: fica aqui ate acabar
 function Bat-Wait {
     while ($ycBatTest -and -not $ycBatTest.done) { Bat-Tick; Start-Sleep -Milliseconds 200 }
+}
+
+$ycBatTest = $null
+if ($batt.present -and $ycSite -and -not $ycNoOpen) {
+    $ycBatTest = @{
+        id = [guid]::NewGuid().ToString('N')
+        seconds = $(if ([int]$ycBatSeconds -gt 0) { [int]$ycBatSeconds } else { 300 })
+        done = $false; frame = 0; startedAt = $null; acSince = $null
+        last = [DateTimeOffset]::UtcNow; drawn = [DateTimeOffset]::MinValue
+        from = $null; to = $null; mwh = $null
+    }
+    $p0 = Get-BatPower
+    if ($p0.ac -ne $false) { Bat-Begin $p0 }
+    $batt.test = [ordered]@{ id = $ycBatTest.id; started = $(if ($ycBatTest.startedAt) { $ycBatTest.startedAt.ToUnixTimeMilliseconds() } else { $null }); seconds = $ycBatTest.seconds }
 }
 
 # ---------- Teclado (layout configurado) ----------
