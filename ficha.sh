@@ -90,6 +90,67 @@ if [ "$OS_KIND" = "Darwin" ]; then
     [ -z "$FAMILY" ] && [ -n "$SKU" ] && [ -f "$SIMA" ] && FAMILY="$(/usr/libexec/PlistBuddy -c "Print :$SKU:_LOCALIZABLE_:marketingModel" "$SIMA" 2>/dev/null)"
     #  3) cache do "Sobre Este Mac"
     [ -z "$FAMILY" ] && FAMILY="$(defaults read com.apple.SystemProfiler 'CPU Names' 2>/dev/null | sed -n 's/.*= "\(.*\)";/\1/p' | head -1)"
+    # numero do modelo (o "A2251" gravado embaixo da maquina). O macOS nao informa esse numero:
+    # vem do identificador (MacBookPro16,2 -> A2251), que quase sempre aponta para um modelo so.
+    # Fonte: everymac.com / theapplewiki.com. Identificador fora da tabela -> fica so o nome.
+    ANUM=""
+    case "$SKU" in
+        MacBookAir5,1|MacBookAir6,1|MacBookAir7,1) ANUM="A1465" ;;
+        MacBookAir5,2|MacBookAir6,2|MacBookAir7,2) ANUM="A1466" ;;
+        MacBookAir8,1|MacBookAir8,2) ANUM="A1932" ;;
+        MacBookAir9,1)  ANUM="A2179" ;;
+        MacBookAir10,1) ANUM="A2337" ;;
+        Mac14,2)        ANUM="A2681" ;;
+        Mac14,15)       ANUM="A2941" ;;
+        Mac15,12)       ANUM="A3113" ;;
+        Mac15,13)       ANUM="A3114" ;;
+        Mac16,12)       ANUM="A3240" ;;
+        Mac16,13)       ANUM="A3241" ;;
+        MacBook8,1|MacBook9,1|MacBook10,1) ANUM="A1534" ;;
+        MacBookPro9,1)  ANUM="A1286" ;;
+        MacBookPro9,2)  ANUM="A1278" ;;
+        MacBookPro10,1|MacBookPro11,2|MacBookPro11,3|MacBookPro11,4|MacBookPro11,5) ANUM="A1398" ;;
+        MacBookPro10,2) ANUM="A1425" ;;
+        MacBookPro11,1|MacBookPro12,1) ANUM="A1502" ;;
+        MacBookPro13,1|MacBookPro14,1) ANUM="A1708" ;;
+        MacBookPro13,2|MacBookPro14,2) ANUM="A1706" ;;
+        MacBookPro13,3|MacBookPro14,3) ANUM="A1707" ;;
+        MacBookPro15,1|MacBookPro15,3) ANUM="A1990" ;;
+        MacBookPro15,2) ANUM="A1989" ;;
+        MacBookPro15,4) ANUM="A2159" ;;
+        MacBookPro16,1|MacBookPro16,4) ANUM="A2141" ;;
+        MacBookPro16,2) ANUM="A2251" ;;
+        MacBookPro16,3) ANUM="A2289" ;;
+        MacBookPro17,1|Mac14,7) ANUM="A2338" ;;
+        MacBookPro18,1|MacBookPro18,2) ANUM="A2485" ;;
+        MacBookPro18,3|MacBookPro18,4) ANUM="A2442" ;;
+        Mac14,5|Mac14,9)  ANUM="A2779" ;;
+        Mac14,6|Mac14,10) ANUM="A2780" ;;
+        Mac15,3)        ANUM="A2918" ;;
+        Mac15,6|Mac15,8|Mac15,10) ANUM="A2992" ;;
+        Mac15,7|Mac15,9|Mac15,11) ANUM="A2991" ;;
+        Mac16,1)        ANUM="A3112" ;;
+        Mac16,8)        ANUM="A3401" ;;
+        Mac16,6)        ANUM="A3185" ;;
+        Mac16,7)        ANUM="A3403" ;;
+        Mac16,5)        ANUM="A3186" ;;
+        iMac13,1|iMac14,1|iMac14,3|iMac14,4|iMac16,1|iMac16,2|iMac18,1|iMac18,2) ANUM="A1418" ;;
+        iMac13,2|iMac14,2|iMac15,1|iMac17,1|iMac18,3) ANUM="A1419" ;;
+        iMac19,1|iMac20,1|iMac20,2) ANUM="A2115" ;;
+        iMac19,2)       ANUM="A2116" ;;
+        iMacPro1,1)     ANUM="A1862" ;;
+        Macmini6,1|Macmini6,2|Macmini7,1) ANUM="A1347" ;;
+        Macmini8,1)     ANUM="A1993" ;;
+        Macmini9,1)     ANUM="A2348" ;;
+        Mac14,3)        ANUM="A2686" ;;
+        Mac14,12)       ANUM="A2816" ;;
+        MacPro6,1)      ANUM="A1481" ;;
+        MacPro7,1)      ANUM="A1991" ;;
+        Mac13,1|Mac13,2) ANUM="A2615" ;;
+        Mac14,13|Mac14,14) ANUM="A2901" ;;
+    esac
+    # o campo modelo fica "MacBook Pro (A2251)": o nome continua (o resto do script procura "MacBook" nele)
+    [ -n "$ANUM" ] && MODEL="${MODEL:+$MODEL }($ANUM)"
 
     step "Processador e memoria"
     CPU_NAME="$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
