@@ -26,7 +26,7 @@ if ("$ycModo" -match '^\s*(2|air)') { $ycAirPrint = $true }
 elseif (-not $ycModo -and -not $ycNoOpen) {
     Write-Host ''
     Write-Host '  [1] Gerar ficha' -ForegroundColor White
-    Write-Host '  [2] Utilizar AirPrint (so imprimir a ficha que ja foi feita)' -ForegroundColor White
+    Write-Host '  [2] Utilizar AirPrint (Opção para utilizar apenas a impressora)' -ForegroundColor White
     Write-Host ''
     $op = $null
     for ($i = 0; $i -lt 5 -and $op -notin '', '1', '2'; $i++) { $op = "$(Read-Host '  Escolha 1 ou 2 (Enter = 1)')".Trim() }
