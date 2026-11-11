@@ -26,7 +26,7 @@ if ("$ycModo" -match '^\s*(2|air)') { $ycAirPrint = $true }
 elseif (-not $ycModo -and -not $ycNoOpen) {
     Write-Host ''
     Write-Host '  [1] Gerar ficha' -ForegroundColor White
-    Write-Host '  [2] Utilizar AirPrint (Opção para utilizar apenas a impressora)' -ForegroundColor White
+    Write-Host '  [2] Utilizar AirPrint (so imprimir a ficha que ja foi feita)' -ForegroundColor White
     Write-Host ''
     $op = $null
     for ($i = 0; $i -lt 5 -and $op -notin '', '1', '2'; $i++) { $op = "$(Read-Host '  Escolha 1 ou 2 (Enter = 1)')".Trim() }
@@ -390,6 +390,12 @@ if (-not $ycAirPrint) {
     # AirPrint: a ficha (e a verificacao da bateria) ja foi feita antes; aqui so liga a ponte de impressao
     $ycBatTest = $null
     if ($ycNoPrint) { Write-Host '  $ycNoPrint esta ligado: nada a fazer no modo AirPrint.' -ForegroundColor Yellow; Write-Host ''; return }
+    # avisa o site: a ficha salva fica travada e so o Imprimir e liberado (a aba da ficha que ja esta aberta recebe)
+    if ($ycSite) {
+        Open-Site '#airprint'
+        Write-Host '  A ficha salva no navegador foi liberada para imprimir (sem poder editar).' -ForegroundColor Green
+        Write-Host ''
+    }
 }
 
 # =====================================================================
@@ -1165,7 +1171,7 @@ foreach ($p in $found) {
 }
 if (-not $found.Count) { Write-Host '  Nenhuma impressora encontrada agora (da para procurar de novo na hora de imprimir).' -ForegroundColor Yellow }
 Write-Host ''
-if ($ycAirPrint) { Write-Host '  Volte para a ficha que ja esta aberta no navegador e clique em "Imprimir na rede".' -ForegroundColor White }
+if ($ycAirPrint) { Write-Host '  Na ficha, clique no icone da impressora e depois em "Imprimir na rede".' -ForegroundColor White }
 Write-Host '  Deixe esta janela aberta para usar "Imprimir na rede" na ficha. Para sair, feche a janela.' -ForegroundColor White
 Write-Host ''
 try {
